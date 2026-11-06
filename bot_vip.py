@@ -1,7 +1,7 @@
+# INSTALAR: py -m pip install -U telethon
+# EJECUTAR: py loschuckys_vip_corregido.py
 
-# INSTALAR:
-# py -m pip install telethon
-
+import asyncio
 import json
 import re
 import time
@@ -12,379 +12,278 @@ from pathlib import Path
 from telethon import TelegramClient, events
 
 # =====================================
-# CONFIGURACION TELEGRAM
+# 1. CONFIGURACION
 # =====================================
-
 API_ID = 34501633
 API_HASH = "cc60b8ad4b4e95ab0908e6ef379efc49"
+
 BASE = Path(__file__).resolve().parent
-
-client = TelegramClient(
-    str(BASE / "loschuckys_sesion"),
-    API_ID,
-    API_HASH
-)
-
-# =====================================
-# DATOS DE PAGO
-# =====================================
-
 QR_URL = "https://i.postimg.cc/sfccGwZ0/image.png"
-
 QR_ARCHIVO = BASE / "qr_pago.png"
-
+IMAGEN_ASESOR = BASE / "asesor.png"  # Opcional
 NUMERO_CUENTA = "09400141002543052450"
-
-# Imagen opcional para responder al comprobante
-IMAGEN_ASESOR = BASE / "asesor.png"
-
-# Archivo para recordar compradores pendientes
 ESTADO_ARCHIVO = BASE / "estado_vip.json"
+VIGENCIA = 7 * 24 * 60 * 60  # 7 dias
 
-# Vigencia de una consulta: 7 dias
-VIGENCIA = 7 * 24 * 60 * 60
+client = TelegramClient(str(BASE / "loschuckys_sesion"), API_ID, API_HASH)
+
+# Cada usuario tiene su estado y bloqueo independiente.
+pendientes = {}
+bloqueos = {}
 
 
 # =====================================
-# GUARDAR Y CARGAR ESTADO
+# 2. GUARDAR Y LEER ESTADO
 # =====================================
-
 def cargar_estado():
     if not ESTADO_ARCHIVO.exists():
         return {}
-
     try:
-        with open(
-            ESTADO_ARCHIVO, "r", encoding="utf-8"
-        ) as archivo:
-            datos = json.load(archivo)
-
+        datos = json.loads(ESTADO_ARCHIVO.read_text(encoding="utf-8"))
+        ahora = time.time()
+        # Compatible con el estado anterior: {"usuario_id": fecha}.
         return {
-            str(k): float(v)
-            for k, v in datos.items()
+            str(uid): float(fecha)
+            for uid, fecha in datos.items()
+            if isinstance(fecha, (int, float))
+            and 0 <= ahora - float(fecha) < VIGENCIA
         }
-
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
+        print("Aviso: no se pudo leer estado_vip.json; se inicia vacio")
         return {}
 
 
-pendientes = cargar_estado()
-
-
 def guardar_estado():
-    with open(
-        ESTADO_ARCHIVO, "w", encoding="utf-8"
-    ) as archivo:
-        json.dump(pendientes, archivo)
+    try:
+        temporal = ESTADO_ARCHIVO.with_suffix(".tmp")
+        temporal.write_text(
+            json.dumps(pendientes, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporal.replace(ESTADO_ARCHIVO)
+    except OSError as error:
+        print("Error al guardar estado:", error)
 
 
-def consulta_pendiente(usuario):
-    fecha = pendientes.get(str(usuario))
-
-    if not fecha:
+def esta_pendiente(uid):
+    fecha = pendientes.get(str(uid))
+    if fecha is None:
         return False
-
-    if time.time() - fecha > VIGENCIA:
-        pendientes.pop(str(usuario), None)
+    if time.time() - fecha >= VIGENCIA:
+        pendientes.pop(str(uid), None)
         guardar_estado()
         return False
-
     return True
 
 
 # =====================================
-# PREPARAR IMAGEN QR
+# 3. QR Y DETECCION
 # =====================================
-
 def preparar_qr():
-    if QR_ARCHIVO.exists():
-        print("QR encontrado")
+    if QR_ARCHIVO.exists() and QR_ARCHIVO.stat().st_size > 0:
+        print("QR local encontrado")
         return
+    try:
+        solicitud = urllib.request.Request(
+            QR_URL, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(solicitud, timeout=15) as respuesta:
+            contenido = respuesta.read()
+        if not contenido:
+            raise ValueError("La descarga del QR llego vacia")
+        QR_ARCHIVO.write_bytes(contenido)
+        print("QR descargado")
+    except Exception as error:
+        print("No se pudo descargar el QR:", error)
+        print("Se enviara un enlace al QR como alternativa")
 
-    print("Descargando QR...")
-
-    solicitud = urllib.request.Request(
-        QR_URL,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-
-    with urllib.request.urlopen(
-        solicitud,
-        timeout=20
-    ) as respuesta:
-        QR_ARCHIVO.write_bytes(respuesta.read())
-
-    print("QR descargado correctamente")
-
-
-# =====================================
-# DETECTAR MENSAJES DE COMPRA VIP
-# =====================================
 
 def normalizar(texto):
-    texto = unicodedata.normalize(
-        "NFD", texto.lower()
-    )
-
+    texto = unicodedata.normalize("NFD", (texto or "").lower())
     return "".join(
-        letra for letra in texto
-        if unicodedata.category(letra) != "Mn"
-    )
+        letra for letra in texto if unicodedata.category(letra) != "Mn"
+    ).strip()
 
 
 def es_consulta_vip(texto):
+    # No exige dos palabras a la vez. Detecta consultas comunes.
     texto = normalizar(texto)
+    return bool(re.search(
+        r"\b(vip|planes?|comprar|compra|precios?|cuanto|"
+        r"pagar|pago|transferencia|activar|activacion|"
+        r"activame|renovar|membresia|grupo\s+vip|"
+        r"informacion\s+vip|licencia)\b",
+        texto,
+    ))
 
-    plan = re.search(
-        r"\b(vip|plan)\b",
-        texto
-    )
-
-    compra = re.search(
-        r"\b(comprar|compra|quiero|pagar|"
-        r"pago|precio|cuanto|adquirir|"
-        r"transferir)\b",
-        texto
-    )
-
-    return bool(plan and compra)
-
-
-# =====================================
-# DETECTAR FOTOS
-# =====================================
 
 def es_imagen(event):
     if event.message.photo:
         return True
-
     archivo = event.message.file
-
-    if archivo:
-        tipo = archivo.mime_type or ""
-        return tipo.startswith("image/")
-
-    return False
+    return bool(archivo and (archivo.mime_type or "").startswith("image/"))
 
 
 # =====================================
-# OBTENER DESTINATARIO
+# 4. RESPUESTAS (EN MENSAJES SEPARADOS)
 # =====================================
+async def enviar_qr(event):
+    if QR_ARCHIVO.exists() and QR_ARCHIVO.stat().st_size > 0:
+        try:
+            destino = await event.get_input_chat()
+            if destino is None:
+                destino = await event.get_sender()
+            if destino is None:
+                raise ValueError("Telegram no resolvio este chat")
+            await client.send_file(destino, str(QR_ARCHIVO))
+            print(f"[{event.sender_id}] QR enviado")
+            return
+        except Exception as error:
+            print(f"[{event.sender_id}] No se pudo adjuntar el QR:", error)
 
-async def obtener_destinatario(event):
-    try:
-        destino = await event.get_input_sender()
-
-        if destino is not None:
-            return destino
-
-    except (ValueError, TypeError):
-        pass
-
-    try:
-        destino = await event.get_input_chat()
-
-        if destino is not None:
-            return destino
-
-    except (ValueError, TypeError):
-        pass
-
-    await client.get_dialogs()
-
-    try:
-        return await event.get_input_sender()
-
-    except (ValueError, TypeError):
-        return None
+    await event.respond("📲 QR para el pago:\n" + QR_URL)
+    print(f"[{event.sender_id}] Enlace de QR enviado")
 
 
-# =====================================
-# MENSAJE 1: ENVIAR QR
-# =====================================
-
-async def enviar_qr(destinatario):
-
-    await client.send_file(
-        destinatario,
-        str(QR_ARCHIVO)
-    )
-
-    print("QR enviado")
-
-
-# =====================================
-# MENSAJE 2: TRANSFERENCIA
-# =====================================
-
-async def enviar_cuenta(destinatario):
-
+async def enviar_cuenta(event):
     texto = (
         "🏦 <b>TRANSFERENCIA BANCARIA</b>\n\n"
-
-        "Si eres BCP o utilizas otro banco, "
-        "puedes consultar la transferencia "
-        "con este número:\n\n"
-
-        f"<pre>{NUMERO_CUENTA}</pre>\n\n"
-
-        "📋 Copia el número para utilizarlo "
-        "en tu aplicación bancaria.\n\n"
-
-        "✅ Verifica el banco y el titular "
-        "antes de realizar la transferencia."
+        "Número de cuenta:\n"
+        f"<code>{NUMERO_CUENTA}</code>\n\n"
+        "📋 Copia el número en tu aplicación bancaria.\n"
+        "✅ Verifica el banco y el titular antes de transferir.\n\n"
+        "📸 Cuando realices el pago, envía una imagen del comprobante "
+        "a este mismo chat."
     )
-
-    await client.send_message(
-        destinatario,
-        texto,
-        parse_mode="html"
-    )
-
-    print("Datos de transferencia enviados")
+    await event.respond(texto, parse_mode="html")
+    print(f"[{event.sender_id}] Cuenta enviada")
 
 
-# =====================================
-# RESPUESTA AL RECIBIR COMPROBANTE
-# =====================================
-
-async def recibir_comprobante(destinatario):
-
-    # Enviar imagen opcional del asesor
+async def recibir_comprobante(event):
     if IMAGEN_ASESOR.exists():
+        try:
+            destino = await event.get_input_chat()
+            if destino is None:
+                destino = await event.get_sender()
+            if destino is not None:
+                await client.send_file(destino, str(IMAGEN_ASESOR))
+        except Exception as error:
+            # La respuesta escrita siempre se intenta enviar.
+            print(f"[{event.sender_id}] Error en imagen del asesor:", error)
 
-        await client.send_file(
-            destinatario,
-            str(IMAGEN_ASESOR)
-        )
-
-    # Enviar texto independiente
-    texto = (
+    await event.respond(
         "👑 <b>LOS CHUCKYS — VIP</b>\n\n"
-
-        "✅ <b>¡Imagen recibida correctamente!</b>\n\n"
-
-        "📩 Hemos recibido tu comprobante.\n\n"
-
-        "⏳ Un asesor se comunicará contigo "
-        "lo antes posible para revisar tu pago "
-        "y coordinar la entrega de tu producto.\n\n"
-
-        "💜 Gracias por tu confianza."
+        "✅ <b>¡Imagen recibida!</b>\n\n"
+        "📩 Recibimos tu comprobante.\n"
+        "⏳ Un asesor revisará el pago y se comunicará contigo "
+        "para coordinar la activación del producto.\n\n"
+        "💜 Gracias por tu confianza.",
+        parse_mode="html",
     )
-
-    await client.send_message(
-        destinatario,
-        texto,
-        parse_mode="html"
-    )
-
-    print("Respuesta de comprobante enviada")
+    print(f"[{event.sender_id}] Comprobante respondido")
 
 
 # =====================================
-# RESPUESTA AUTOMATICA PRINCIPAL
+# 5. MENSAJES ENTRANTES
 # =====================================
-
 @client.on(events.NewMessage(incoming=True))
 async def respuesta_automatica(event):
-
-    # Solo mensajes privados
-    if not event.is_private:
+    if not event.is_private or event.sender_id is None:
         return
 
-    usuario = event.sender_id
+    uid = str(event.sender_id)
+    if uid not in bloqueos:
+        bloqueos[uid] = asyncio.Lock()
 
-    if usuario is None:
-        return
+    # Solo se bloquea la conversacion de ESTE usuario.
+    # Otros clientes pueden escribir mientras tanto.
+    async with bloqueos[uid]:
+        try:
+            mensaje = (event.raw_text or "").strip()
+            print(f"[{uid}] Mensaje nuevo: {mensaje[:65]!r} | foto={es_imagen(event)}")
 
-    mensaje = event.raw_text or ""
+            # 1. Si llego una imagen, comprobar si esperaba un pago.
+            if es_imagen(event):
+                if esta_pendiente(uid):
+                    await recibir_comprobante(event)
+                    pendientes.pop(uid, None)
+                    guardar_estado()
+                else:
+                    await event.respond(
+                        "📸 Recibí tu imagen. Si quieres enviar un "
+                        "comprobante VIP, escribe primero <b>VIP</b> "
+                        "para recibir los datos de pago.",
+                        parse_mode="html",
+                    )
+                return
 
-    try:
-        # Obtener destinatario sin usar solo ID
-        destinatario = await obtener_destinatario(event)
+            if not mensaje:
+                return
 
-        if destinatario is None:
-            print("No se pudo reconocer destinatario")
-            return
+            texto = normalizar(mensaje)
 
-        # ==================================
-        # CASO 1: RECIBEN UNA IMAGEN
-        # ==================================
+            # 2. Solicitudes de compra, planes o activacion.
+            if es_consulta_vip(mensaje):
+                if esta_pendiente(uid) and texto not in ("vip", "/vip", "reenviar"):
+                    await event.respond(
+                        "✅ Ya te envié el QR y la cuenta.\n"
+                        "📸 Envía tu comprobante aquí.\n"
+                        "🔄 Para recibirlos otra vez escribe: VIP"
+                    )
+                    return
 
-        if es_imagen(event):
-
-            if consulta_pendiente(usuario):
-
-                print("Comprobante recibido")
-
-                await recibir_comprobante(
-                    destinatario
-                )
-
-                # Evitar respuestas repetidas
-                pendientes.pop(str(usuario), None)
+                # Registrar antes de enviar: si falla un envio, la foto
+                # posterior del mismo usuario no se pierde.
+                pendientes[uid] = time.time()
                 guardar_estado()
 
-            return
+                # Mensaje 1: imagen QR (sin descripcion).
+                await enviar_qr(event)
 
-        # ==================================
-        # CASO 2: CONSULTAN UN PLAN VIP
-        # ==================================
+                # Mensaje 2: datos bancarios (texto independiente).
+                await enviar_cuenta(event)
+                return
 
-        if es_consulta_vip(mensaje):
+            # 3. Nunca se queda en silencio al recibir un texto privado.
+            if esta_pendiente(uid):
+                await event.respond(
+                    "👑 Tu consulta VIP sigue pendiente.\n"
+                    "📸 Envíame la imagen de tu comprobante.\n"
+                    "🔄 Escribe VIP para volver a recibir el QR y la cuenta."
+                )
+            else:
+                await event.respond(
+                    "👋 ¡Hola! Soy el asistente de LOS CHUCKYS.\n\n"
+                    "👑 Para consultar los planes o realizar una compra, "
+                    "escribe: VIP"
+                )
 
-            print("Nueva consulta VIP")
-
-            # Primero el QR sin texto
-            await enviar_qr(destinatario)
-
-            # Segundo mensaje separado
-            await enviar_cuenta(destinatario)
-
-            # Esperar imagen del comprador
-            pendientes[str(usuario)] = time.time()
-            guardar_estado()
-
-            print("Esperando comprobante...")
-
-    except Exception as error:
-        print(
-            "Error en respuesta automatica:",
-            error
-        )
+        except Exception as error:
+            print(f"[{uid}] ERROR al responder: {type(error).__name__}: {error}")
 
 
 # =====================================
-# INICIAR PROGRAMA
+# 6. INICIAR
 # =====================================
-
 async def iniciar():
-
-    if API_ID <= 0 or API_HASH == "TU_API_HASH":
-        print("Configura API_ID y API_HASH")
+    if API_ID <= 0 or API_HASH == "PEGA_AQUI_TU_API_HASH":
+        print("ERROR: coloca tu API_ID y API_HASH en el archivo")
         return
 
-    preparar_qr()
+    pendientes.update(cargar_estado())
+    await asyncio.to_thread(preparar_qr)
 
     await client.start()
-
-    # Cargar los chats conocidos
-    await client.get_dialogs()
-
-    usuario = await client.get_me()
-
-    print("=" * 45)
-    print("👑 LOS CHUCKYS — BOT VIP")
-    print("=" * 45)
-    print("Cuenta:", usuario.first_name)
-    print("✅ Telegram conectado")
-    print("✅ QR automatico activado")
-    print("✅ Cuenta bancaria activada")
-    print("✅ Deteccion de imagenes activada")
-    print("✅ Respuesta de asesor activada")
-    print("Esperando mensajes privados...")
-    print("=" * 45)
+    yo = await client.get_me()
+    print("=" * 48)
+    print("👑 LOS CHUCKYS — VIP")
+    print("Conectado como:", yo.first_name)
+    print("✅ Mensajes privados activos")
+    print("✅ QR y cuenta se envian por separado")
+    print("✅ Cada comprador tiene su propio estado")
+    print("✅ Imagenes y comprobantes detectados")
+    print("Esperando mensajes...")
+    print("=" * 48)
 
     await client.run_until_disconnected()
 
@@ -393,9 +292,7 @@ if __name__ == "__main__":
     try:
         with client:
             client.loop.run_until_complete(iniciar())
-
     except KeyboardInterrupt:
         print("Programa detenido")
-
     except Exception as error:
-        print("Error al iniciar:", error)
+        print("Error al iniciar:", type(error).__name__, error)
