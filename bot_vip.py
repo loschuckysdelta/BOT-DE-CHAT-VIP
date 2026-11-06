@@ -13,8 +13,7 @@ from telethon.errors import FloodWaitError
 
 # ================== CONFIGURACION ==================
 API_ID = 34501633
-# Puedes escribir tu API hash entre las comillas o usar TELEGRAM_API_HASH.
-API_HASH = os.getenv("TELEGRAM_API_HASH", "PON_AQUI_TU_API_HASH")
+API_HASH = "cc60b8ad4b4e95ab0908e6ef379efc49"
 
 BASE = Path(__file__).resolve().parent
 SESION = BASE / "loschuckys_sesion"  # Misma sesion del proyecto anterior
