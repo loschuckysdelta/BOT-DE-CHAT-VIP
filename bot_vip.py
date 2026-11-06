@@ -1,87 +1,110 @@
-# INSTALAR: py -m pip install -U telethon
-# EJECUTAR: py loschuckys_vip_corregido.py
-
 import asyncio
 import json
-import re
+import logging
+import os
+import sys
 import time
-import unicodedata
 import urllib.request
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 
-# =====================================
-# 1. CONFIGURACION
-# =====================================
+# ================== CONFIGURACION ==================
 API_ID = 34501633
-API_HASH = "cc60b8ad4b4e95ab0908e6ef379efc49"
+# Puedes escribir tu API hash entre las comillas o usar TELEGRAM_API_HASH.
+API_HASH = os.getenv("TELEGRAM_API_HASH", "PON_AQUI_TU_API_HASH")
 
 BASE = Path(__file__).resolve().parent
+SESION = BASE / "loschuckys_sesion"  # Misma sesion del proyecto anterior
 QR_URL = "https://i.postimg.cc/sfccGwZ0/image.png"
 QR_ARCHIVO = BASE / "qr_pago.png"
-IMAGEN_ASESOR = BASE / "asesor.png"  # Opcional
+IMAGEN_ASESOR = BASE / "asesor.png"  # Opcional: imagen enviada antes del texto
 NUMERO_CUENTA = "09400141002543052450"
 ESTADO_ARCHIVO = BASE / "estado_vip.json"
-VIGENCIA = 7 * 24 * 60 * 60  # 7 dias
+VIGENCIA = 7 * 24 * 60 * 60
+RECONEXION_SEGUNDOS = 10
 
-client = TelegramClient(str(BASE / "loschuckys_sesion"), API_ID, API_HASH)
+# Evita guardar una cantidad ilimitada de archivos de registro.
+logger = logging.getLogger("vip")
+logger.setLevel(logging.INFO)
+formato = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+consola = logging.StreamHandler(sys.stdout)
+consola.setFormatter(formato)
+archivo_log = RotatingFileHandler(
+    BASE / "bot_vip.log", maxBytes=2_000_000, backupCount=2, encoding="utf-8"
+)
+archivo_log.setFormatter(formato)
+logger.addHandler(consola)
+logger.addHandler(archivo_log)
 
-# Cada usuario tiene su estado y bloqueo independiente.
-pendientes = {}
+client = TelegramClient(
+    str(SESION), API_ID, API_HASH,
+    auto_reconnect=True,
+    connection_retries=10,
+    retry_delay=5,
+    request_retries=5,
+    timeout=20,
+)
+
+# Estados independientes para cada cliente.
+estados = {}
 bloqueos = {}
 
 
-# =====================================
-# 2. GUARDAR Y LEER ESTADO
-# =====================================
 def cargar_estado():
     if not ESTADO_ARCHIVO.exists():
         return {}
     try:
         datos = json.loads(ESTADO_ARCHIVO.read_text(encoding="utf-8"))
+        resultado = {}
         ahora = time.time()
-        # Compatible con el estado anterior: {"usuario_id": fecha}.
-        return {
-            str(uid): float(fecha)
-            for uid, fecha in datos.items()
-            if isinstance(fecha, (int, float))
-            and 0 <= ahora - float(fecha) < VIGENCIA
-        }
-    except (OSError, ValueError, TypeError, AttributeError):
-        print("Aviso: no se pudo leer estado_vip.json; se inicia vacio")
+        for id_usuario, valor in datos.items():
+            # Compatible con el archivo anterior: {"123": 1760000000.0}
+            if isinstance(valor, (int, float)):
+                valor = {"fecha": float(valor), "estado": "pendiente"}
+            if not isinstance(valor, dict):
+                continue
+            fecha = float(valor.get("fecha", 0))
+            if 0 <= ahora - fecha < VIGENCIA:
+                estado = valor.get("estado", "pendiente")
+                resultado[str(id_usuario)] = {
+                    "fecha": fecha,
+                    "estado": estado if estado in ("pendiente", "revision") else "pendiente",
+                }
+        return resultado
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("No se pudo leer el estado anterior: %s", exc)
         return {}
 
 
 def guardar_estado():
     try:
         temporal = ESTADO_ARCHIVO.with_suffix(".tmp")
-        temporal.write_text(
-            json.dumps(pendientes, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        temporal.write_text(json.dumps(estados, indent=2), encoding="utf-8")
         temporal.replace(ESTADO_ARCHIVO)
-    except OSError as error:
-        print("Error al guardar estado:", error)
+    except OSError:
+        logger.exception("No se pudo guardar estado_vip.json")
 
 
-def esta_pendiente(uid):
-    fecha = pendientes.get(str(uid))
-    if fecha is None:
-        return False
-    if time.time() - fecha >= VIGENCIA:
-        pendientes.pop(str(uid), None)
+def estado_actual(uid):
+    dato = estados.get(uid)
+    if dato and time.time() - dato["fecha"] >= VIGENCIA:
+        estados.pop(uid, None)
         guardar_estado()
-        return False
-    return True
+        return None
+    return dato["estado"] if dato else None
 
 
-# =====================================
-# 3. QR Y DETECCION
-# =====================================
+def fijar_estado(uid, nuevo):
+    estados[uid] = {"fecha": time.time(), "estado": nuevo}
+    guardar_estado()
+
+
 def preparar_qr():
-    if QR_ARCHIVO.exists() and QR_ARCHIVO.stat().st_size > 0:
-        print("QR local encontrado")
+    if QR_ARCHIVO.is_file() and QR_ARCHIVO.stat().st_size > 0:
+        logger.info("QR listo (archivo local)")
         return
     try:
         solicitud = urllib.request.Request(
@@ -92,29 +115,10 @@ def preparar_qr():
         if not contenido:
             raise ValueError("La descarga del QR llego vacia")
         QR_ARCHIVO.write_bytes(contenido)
-        print("QR descargado")
-    except Exception as error:
-        print("No se pudo descargar el QR:", error)
-        print("Se enviara un enlace al QR como alternativa")
-
-
-def normalizar(texto):
-    texto = unicodedata.normalize("NFD", (texto or "").lower())
-    return "".join(
-        letra for letra in texto if unicodedata.category(letra) != "Mn"
-    ).strip()
-
-
-def es_consulta_vip(texto):
-    # No exige dos palabras a la vez. Detecta consultas comunes.
-    texto = normalizar(texto)
-    return bool(re.search(
-        r"\b(vip|planes?|comprar|compra|precios?|cuanto|"
-        r"pagar|pago|transferencia|activar|activacion|"
-        r"activame|renovar|membresia|grupo\s+vip|"
-        r"informacion\s+vip|licencia)\b",
-        texto,
-    ))
+        logger.info("QR descargado correctamente")
+    except Exception as exc:
+        # No detenemos el programa por un QR que no se pueda descargar.
+        logger.warning("No se pudo descargar el QR: %s", exc)
 
 
 def es_imagen(event):
@@ -124,175 +128,169 @@ def es_imagen(event):
     return bool(archivo and (archivo.mime_type or "").startswith("image/"))
 
 
-# =====================================
-# 4. RESPUESTAS (EN MENSAJES SEPARADOS)
-# =====================================
-async def enviar_qr(event):
-    if QR_ARCHIVO.exists() and QR_ARCHIVO.stat().st_size > 0:
+async def mandar_qr(event):
+    # event.respond resuelve el chat de este mensaje privado; no buscar usuario por ID.
+    if QR_ARCHIVO.is_file() and QR_ARCHIVO.stat().st_size > 0:
         try:
-            destino = await event.get_input_chat()
-            if destino is None:
-                destino = await event.get_sender()
-            if destino is None:
-                raise ValueError("Telegram no resolvio este chat")
-            await client.send_file(destino, str(QR_ARCHIVO))
-            print(f"[{event.sender_id}] QR enviado")
+            await event.respond(file=str(QR_ARCHIVO))
+            logger.info("QR enviado a %s", event.sender_id)
             return
-        except Exception as error:
-            print(f"[{event.sender_id}] No se pudo adjuntar el QR:", error)
-
-    await event.respond("📲 QR para el pago:\n" + QR_URL)
-    print(f"[{event.sender_id}] Enlace de QR enviado")
+        except Exception as exc:
+            logger.warning("No se pudo adjuntar QR para %s: %s", event.sender_id, exc)
+    await event.respond("📲 QR de pago:\n" + QR_URL)
 
 
-async def enviar_cuenta(event):
-    texto = (
+async def mandar_cuenta(event):
+    # Segundo mensaje, separado de la imagen QR.
+    await event.respond(
         "🏦 <b>TRANSFERENCIA BANCARIA</b>\n\n"
         "Número de cuenta:\n"
         f"<code>{NUMERO_CUENTA}</code>\n\n"
         "📋 Copia el número en tu aplicación bancaria.\n"
         "✅ Verifica el banco y el titular antes de transferir.\n\n"
-        "📸 Cuando realices el pago, envía una imagen del comprobante "
-        "a este mismo chat."
+        "📸 Cuando realices el pago, envía una foto del comprobante a este chat.",
+        parse_mode="html",
     )
-    await event.respond(texto, parse_mode="html")
-    print(f"[{event.sender_id}] Cuenta enviada")
 
 
-async def recibir_comprobante(event):
-    if IMAGEN_ASESOR.exists():
+async def mandar_recibido(event):
+    if IMAGEN_ASESOR.is_file():
         try:
-            destino = await event.get_input_chat()
-            if destino is None:
-                destino = await event.get_sender()
-            if destino is not None:
-                await client.send_file(destino, str(IMAGEN_ASESOR))
-        except Exception as error:
-            # La respuesta escrita siempre se intenta enviar.
-            print(f"[{event.sender_id}] Error en imagen del asesor:", error)
-
+            await event.respond(file=str(IMAGEN_ASESOR))
+        except Exception as exc:
+            logger.warning("No se pudo adjuntar imagen asesor: %s", exc)
     await event.respond(
         "👑 <b>LOS CHUCKYS — VIP</b>\n\n"
-        "✅ <b>¡Imagen recibida!</b>\n\n"
-        "📩 Recibimos tu comprobante.\n"
-        "⏳ Un asesor revisará el pago y se comunicará contigo "
-        "para coordinar la activación del producto.\n\n"
+        "✅ <b>¡Imagen recibida correctamente!</b>\n\n"
+        "📩 Hemos recibido tu comprobante.\n\n"
+        "⏳ Un asesor se comunicará contigo lo antes posible para revisar "
+        "tu pago y coordinar la entrega de tu producto.\n\n"
         "💜 Gracias por tu confianza.",
         parse_mode="html",
     )
-    print(f"[{event.sender_id}] Comprobante respondido")
 
 
-# =====================================
-# 5. MENSAJES ENTRANTES
-# =====================================
 @client.on(events.NewMessage(incoming=True))
-async def respuesta_automatica(event):
+async def responder(event):
+    # Solo mensajes privados entrantes, nunca grupos ni canales.
     if not event.is_private or event.sender_id is None:
         return
-
     uid = str(event.sender_id)
-    if uid not in bloqueos:
-        bloqueos[uid] = asyncio.Lock()
+    bloqueo = bloqueos.setdefault(uid, asyncio.Lock())
 
-    # Solo se bloquea la conversacion de ESTE usuario.
-    # Otros clientes pueden escribir mientras tanto.
-    async with bloqueos[uid]:
+    async with bloqueo:
         try:
-            mensaje = (event.raw_text or "").strip()
-            print(f"[{uid}] Mensaje nuevo: {mensaje[:65]!r} | foto={es_imagen(event)}")
+            # Evita conversaciones automaticas entre bots.
+            remitente = event.sender
+            if remitente is not None and getattr(remitente, "bot", False):
+                return
 
-            # 1. Si llego una imagen, comprobar si esperaba un pago.
+            texto = (event.raw_text or "").strip().lower()
+            estado = estado_actual(uid)
+            logger.info("Mensaje privado de %s | imagen=%s | estado=%s", uid, es_imagen(event), estado)
+
             if es_imagen(event):
-                if esta_pendiente(uid):
-                    await recibir_comprobante(event)
-                    pendientes.pop(uid, None)
-                    guardar_estado()
+                if estado == "pendiente":
+                    # Marcar revision solo despues de conseguir responder.
+                    await mandar_recibido(event)
+                    fijar_estado(uid, "revision")
+                elif estado == "revision":
+                    await event.respond(
+                        "✅ Recibí tu nueva imagen. Tu comprobante sigue en revisión; "
+                        "un asesor se comunicará contigo."
+                    )
                 else:
                     await event.respond(
-                        "📸 Recibí tu imagen. Si quieres enviar un "
-                        "comprobante VIP, escribe primero <b>VIP</b> "
-                        "para recibir los datos de pago.",
-                        parse_mode="html",
+                        "📸 Imagen recibida. Si es un comprobante, un asesor lo revisará. "
+                        "Para recibir QR y cuenta escribe: VIP"
                     )
                 return
 
-            if not mensaje:
+            # VIP/QR/REENVIAR siempre permite solicitar datos otra vez.
+            if texto in ("vip", "/vip", "qr", "reenviar", "/start", "pagar"):
+                fijar_estado(uid, "pendiente")
+                await mandar_qr(event)
+                await mandar_cuenta(event)
                 return
 
-            texto = normalizar(mensaje)
-
-            # 2. Solicitudes de compra, planes o activacion.
-            if es_consulta_vip(mensaje):
-                if esta_pendiente(uid) and texto not in ("vip", "/vip", "reenviar"):
-                    await event.respond(
-                        "✅ Ya te envié el QR y la cuenta.\n"
-                        "📸 Envía tu comprobante aquí.\n"
-                        "🔄 Para recibirlos otra vez escribe: VIP"
-                    )
-                    return
-
-                # Registrar antes de enviar: si falla un envio, la foto
-                # posterior del mismo usuario no se pierde.
-                pendientes[uid] = time.time()
-                guardar_estado()
-
-                # Mensaje 1: imagen QR (sin descripcion).
-                await enviar_qr(event)
-
-                # Mensaje 2: datos bancarios (texto independiente).
-                await enviar_cuenta(event)
+            if estado == "revision":
+                await event.respond(
+                    "👑 LOS CHUCKYS — VIP\n\n"
+                    "✅ Ya recibimos tu comprobante.\n"
+                    "⏳ Un asesor revisará el pago y se comunicará contigo.\n"
+                    "📲 Para recibir los datos de pago otra vez escribe: VIP"
+                )
                 return
 
-            # 3. Nunca se queda en silencio al recibir un texto privado.
-            if esta_pendiente(uid):
+            if estado == "pendiente":
                 await event.respond(
-                    "👑 Tu consulta VIP sigue pendiente.\n"
-                    "📸 Envíame la imagen de tu comprobante.\n"
-                    "🔄 Escribe VIP para volver a recibir el QR y la cuenta."
+                    "👑 LOS CHUCKYS — VIP\n\n"
+                    "✅ Ya te envié el QR y el número de cuenta.\n"
+                    "📸 Envíame una imagen del comprobante cuando realices el pago.\n"
+                    "🔄 Si necesitas recibirlos otra vez escribe: VIP"
                 )
-            else:
-                await event.respond(
-                    "👋 ¡Hola! Soy el asistente de LOS CHUCKYS.\n\n"
-                    "👑 Para consultar los planes o realizar una compra, "
-                    "escribe: VIP"
-                )
+                return
 
-        except Exception as error:
-            print(f"[{uid}] ERROR al responder: {type(error).__name__}: {error}")
+            # PRIMER mensaje de una persona: cualquier texto, audio, sticker, etc.
+            # No exige que escriba "VIP", "comprar" ni "precio".
+            fijar_estado(uid, "pendiente")
+            await mandar_qr(event)
+            await mandar_cuenta(event)
+
+        except FloodWaitError as exc:
+            logger.warning("Telegram aplico espera de %s segundos", exc.seconds)
+            # No se cierra el bot. Se respeta el limite del servidor.
+            await asyncio.sleep(min(int(exc.seconds), 3600))
+        except Exception:
+            # Un error en un chat jamas debe cerrar los demas chats.
+            logger.exception("Error respondiendo al usuario %s", uid)
 
 
-# =====================================
-# 6. INICIAR
-# =====================================
 async def iniciar():
-    if API_ID <= 0 or API_HASH == "PEGA_AQUI_TU_API_HASH":
-        print("ERROR: coloca tu API_ID y API_HASH en el archivo")
-        return
+    if API_ID <= 0 or not API_HASH or API_HASH == "PON_AQUI_TU_API_HASH":
+        raise RuntimeError("Configura API_ID y API_HASH en bot_vip.py")
 
-    pendientes.update(cargar_estado())
+    estados.update(cargar_estado())
     await asyncio.to_thread(preparar_qr)
 
-    await client.start()
-    yo = await client.get_me()
-    print("=" * 48)
-    print("👑 LOS CHUCKYS — VIP")
-    print("Conectado como:", yo.first_name)
-    print("✅ Mensajes privados activos")
-    print("✅ QR y cuenta se envian por separado")
-    print("✅ Cada comprador tiene su propio estado")
-    print("✅ Imagenes y comprobantes detectados")
-    print("Esperando mensajes...")
-    print("=" * 48)
+    if "--login" in sys.argv:
+        # La primera vez es interactiva: Telegram pide telefono/codigo.
+        await client.start()
+        yo = await client.get_me()
+        logger.info("Inicio de sesion guardado para: %s", yo.first_name)
+        await client.disconnect()
+        return
 
-    await client.run_until_disconnected()
+    while True:
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                logger.error("Falta iniciar sesion. Ejecuta: python3 bot_vip.py --login")
+                return
+            yo = await client.get_me()
+            logger.info("LOS CHUCKYS VIP ACTIVO | %s | esperando mensajes privados", yo.first_name)
+            await client.run_until_disconnected()
+            logger.warning("Telegram se desconecto. Se intentara reconectar.")
+        except asyncio.CancelledError:
+            raise
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            logger.exception("Conexion de Telegram interrumpida")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.exception("Error al cerrar la conexion anterior")
+        logger.info("Nuevo intento en %s segundos", RECONEXION_SEGUNDOS)
+        await asyncio.sleep(RECONEXION_SEGUNDOS)
 
 
 if __name__ == "__main__":
     try:
-        with client:
-            client.loop.run_until_complete(iniciar())
+        asyncio.run(iniciar())
     except KeyboardInterrupt:
-        print("Programa detenido")
-    except Exception as error:
-        print("Error al iniciar:", type(error).__name__, error)
+        logger.info("Detenido manualmente")
+    except Exception:
+        logger.exception("No se pudo iniciar el programa")
+        sys.exit(1)
